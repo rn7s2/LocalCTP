@@ -8,3 +8,6 @@ libthosttraderapi_se_v*.so
 
 # Debug folder
 Debug
+
+# .vs folder
+.vs

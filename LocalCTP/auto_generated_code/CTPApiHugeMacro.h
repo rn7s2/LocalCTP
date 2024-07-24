@@ -59,6 +59,9 @@
     /*///请求查询交易编码*/ \
     virtual int ReqQryTradingCode(CThostFtdcQryTradingCodeField *pQryTradingCode, int nRequestID) override { return -1; } \
  \
+    /*///请求查询交易员报盘机*/ \
+    virtual int ReqQryTraderOffer(CThostFtdcQryTraderOfferField *pQryTraderOffer, int nRequestID) override { return -1; } \
+ \
     /*///请求查询转帐银行*/ \
     virtual int ReqQryTransferBank(CThostFtdcQryTransferBankField *pQryTransferBank, int nRequestID) override { return -1; } \
  \
@@ -224,6 +227,84 @@ virtual int ReqQryClassifiedInstrument(CThostFtdcQryClassifiedInstrumentField* p
     return 0; \
 } \
     /*///请求组合优惠比例*/ \
-    virtual int ReqQryCombPromotionParam(CThostFtdcQryCombPromotionParamField *pQryCombPromotionParam, int nRequestID) override { return -1; }
+    virtual int ReqQryCombPromotionParam(CThostFtdcQryCombPromotionParamField *pQryCombPromotionParam, int nRequestID) override { return -1; } \
+ \
+    /*///投资者风险结算持仓查询*/ \
+    virtual int ReqQryRiskSettleInvstPosition(CThostFtdcQryRiskSettleInvstPositionField *pQryRiskSettleInvstPosition, int nRequestID) override { return -1; } \
+ \
+    /*///风险结算产品查询*/ \
+    virtual int ReqQryRiskSettleProductStatus(CThostFtdcQryRiskSettleProductStatusField *pQryRiskSettleProductStatus, int nRequestID) override { return -1; } \
+ \
+    /*///SPBM期货合约参数查询*/ \
+    virtual int ReqQrySPBMFutureParameter(CThostFtdcQrySPBMFutureParameterField *pQrySPBMFutureParameter, int nRequestID) override { return -1; } \
+ \
+    /*///SPBM期权合约参数查询*/ \
+    virtual int ReqQrySPBMOptionParameter(CThostFtdcQrySPBMOptionParameterField *pQrySPBMOptionParameter, int nRequestID) override { return -1; } \
+ \
+    /*///SPBM品种内对锁仓折扣参数查询*/ \
+    virtual int ReqQrySPBMIntraParameter(CThostFtdcQrySPBMIntraParameterField *pQrySPBMIntraParameter, int nRequestID) override { return -1; } \
+ \
+    /*///SPBM跨品种抵扣参数查询*/ \
+    virtual int ReqQrySPBMInterParameter(CThostFtdcQrySPBMInterParameterField *pQrySPBMInterParameter, int nRequestID) override { return -1; } \
+ \
+    /*///SPBM组合保证金套餐查询*/ \
+    virtual int ReqQrySPBMPortfDefinition(CThostFtdcQrySPBMPortfDefinitionField *pQrySPBMPortfDefinition, int nRequestID) override { return -1; } \
+ \
+    /*///投资者SPBM套餐选择查询*/ \
+    virtual int ReqQrySPBMInvestorPortfDef(CThostFtdcQrySPBMInvestorPortfDefField *pQrySPBMInvestorPortfDef, int nRequestID) override { return -1; } \
+ \
+    /*///投资者新型组合保证金系数查询*/ \
+    virtual int ReqQryInvestorPortfMarginRatio(CThostFtdcQryInvestorPortfMarginRatioField *pQryInvestorPortfMarginRatio, int nRequestID) override { return -1; } \
+ \
+    /*///投资者产品SPBM明细查询*/ \
+    virtual int ReqQryInvestorProdSPBMDetail(CThostFtdcQryInvestorProdSPBMDetailField *pQryInvestorProdSPBMDetail, int nRequestID) override { return -1; } \
+ \
+    /*///投资者商品组SPMM记录查询*/ \
+    virtual int ReqQryInvestorCommoditySPMMMargin(CThostFtdcQryInvestorCommoditySPMMMarginField *pQryInvestorCommoditySPMMMargin, int nRequestID) override { return -1; } \
+ \
+    /*///投资者商品群SPMM记录查询*/ \
+    virtual int ReqQryInvestorCommodityGroupSPMMMargin(CThostFtdcQryInvestorCommodityGroupSPMMMarginField *pQryInvestorCommodityGroupSPMMMargin, int nRequestID) override { return -1; } \
+ \
+    /*///SPMM合约参数查询*/ \
+    virtual int ReqQrySPMMInstParam(CThostFtdcQrySPMMInstParamField *pQrySPMMInstParam, int nRequestID) override { return -1; } \
+ \
+    /*///SPMM产品参数查询*/ \
+    virtual int ReqQrySPMMProductParam(CThostFtdcQrySPMMProductParamField *pQrySPMMProductParam, int nRequestID) override { return -1; } \
+ \
+    /*///SPBM附加跨品种抵扣参数查询*/ \
+    virtual int ReqQrySPBMAddOnInterParameter(CThostFtdcQrySPBMAddOnInterParameterField *pQrySPBMAddOnInterParameter, int nRequestID) override { return -1; } \
+ \
+    /*///RCAMS产品组合信息查询*/ \
+    virtual int ReqQryRCAMSCombProductInfo(CThostFtdcQryRCAMSCombProductInfoField *pQryRCAMSCombProductInfo, int nRequestID) override { return -1; } \
+ \
+    /*///RCAMS同合约风险对冲参数查询*/ \
+    virtual int ReqQryRCAMSInstrParameter(CThostFtdcQryRCAMSInstrParameterField *pQryRCAMSInstrParameter, int nRequestID) override { return -1; } \
+ \
+    /*///RCAMS品种内风险对冲参数查询*/ \
+    virtual int ReqQryRCAMSIntraParameter(CThostFtdcQryRCAMSIntraParameterField *pQryRCAMSIntraParameter, int nRequestID) override { return -1; } \
+ \
+    /*///RCAMS跨品种风险折抵参数查询*/ \
+    virtual int ReqQryRCAMSInterParameter(CThostFtdcQryRCAMSInterParameterField *pQryRCAMSInterParameter, int nRequestID) override { return -1; } \
+ \
+    /*///RCAMS空头期权风险调整参数查询*/ \
+    virtual int ReqQryRCAMSShortOptAdjustParam(CThostFtdcQryRCAMSShortOptAdjustParamField *pQryRCAMSShortOptAdjustParam, int nRequestID) override { return -1; } \
+ \
+    /*///RCAMS策略组合持仓查询*/ \
+    virtual int ReqQryRCAMSInvestorCombPosition(CThostFtdcQryRCAMSInvestorCombPositionField *pQryRCAMSInvestorCombPosition, int nRequestID) override { return -1; } \
+ \
+    /*///投资者品种RCAMS保证金查询*/ \
+    virtual int ReqQryInvestorProdRCAMSMargin(CThostFtdcQryInvestorProdRCAMSMarginField *pQryInvestorProdRCAMSMargin, int nRequestID) override { return -1; } \
+ \
+    /*///RULE合约保证金参数查询*/ \
+    virtual int ReqQryRULEInstrParameter(CThostFtdcQryRULEInstrParameterField *pQryRULEInstrParameter, int nRequestID) override { return -1; } \
+ \
+    /*///RULE品种内对锁仓折扣参数查询*/ \
+    virtual int ReqQryRULEIntraParameter(CThostFtdcQryRULEIntraParameterField *pQryRULEIntraParameter, int nRequestID) override { return -1; } \
+ \
+    /*///RULE跨品种抵扣参数查询*/ \
+    virtual int ReqQryRULEInterParameter(CThostFtdcQryRULEInterParameterField *pQryRULEInterParameter, int nRequestID) override { return -1; } \
+ \
+    /*///投资者产品RULE保证金查询*/ \
+    virtual int ReqQryInvestorProdRULEMargin(CThostFtdcQryInvestorProdRULEMarginField *pQryInvestorProdRULEMargin, int nRequestID) override { return -1; }
 
 #endif
