@@ -145,6 +145,8 @@ Linux中, 还可以将`current`设置为指向实际CTP头文件目录软链接,
 
 合约的费率（保证金率和手续费率）从数据库的两张费率表中读取，如果费率表中没有该合约数据，则按默认值处理（保证金率全为10%，手续费全为1元每手）。
 
+由于期权的保证金计算较为复杂，因此期权的保证金计算方式复用期货的逻辑，即只使用一个绝对值的保证金率来计算保证金。
+
 持仓和资金，会根据订单、成交和行情数据等来动态更新。
 
 账户数据会自动持久化保存到本地的sqlite3数据库(LocalCTP.db,会自动创建数据库及表,无需手动创建)中. 分为资金,持仓,持仓明细,订单,成交等表.
@@ -171,6 +173,32 @@ Windows中可使用 [DB Browser for SQLite](https://sqlitebrowser.org/) 等软�
 每个交易日的下午17点左右，系统会对所有账户进行结算。结算单会存储在数据库中。
 
 报单时，不会校验账户是否已经确认过结算单。
+
+#### 运行模式说明
+1. 实时模式(默认)
+模拟实盘实时运行, 内部时间使用机器当前时间, 会在交易日下午5点进行结算.
+
+1. 回测模式
+指定开始回测的日期, 内部时间使用投喂给本系统的行情时间戳, 也会在内部时间到达新的交易日时进行结算, 可以通过结算单查看历史绩效等数据.
+
+注意: 若处于回测模式, 为保持每次回测的数据独立和完整, 系统在回测启动时会清空数据库中各账户的数据, 请做好数据备份.
+
+回测中,为避免更新数据库频繁导致性能问题,在接受行情投喂时,每间隔100个行情快照,才将资金和持仓等(随着行情而变化的)数据更新到SQL数据库里一次.
+
+#### 配置文件说明
+通过配置文件 `localctp.config` 配置运行模式和回测开始的时间, `running_mode`为0表示实时模式(默认),为1表示回测模式,`backtest_startdate`表示回测起始日期, `exit_after_settlement`表示是否在结算后退出程序(默认为0即不退出,非0值表示退出), `settlement_time`表示结算时间(默认17:00:00, 建议不早于16点以免还没有收到含结算价的行情数据)
+
+示例:
+
+    // localctp.config file
+
+    running_mode=1
+    
+    backtest_startdate=20250228
+
+    exit_after_settlement = 1
+
+    settlement_time=17:00:00
 
 
 ### 本项目还存在的一些可以改进的小的点：
@@ -238,6 +266,17 @@ Windows中可使用 [DB Browser for SQLite](https://sqlitebrowser.org/) 等软�
     sudo yum install -y kde-l10n-Chinese
     sudo yum reinstall -y glibc-common
 
+### References
 
-**制作不容易，请一定要多多支持！欢迎打赏投食鼓励！~**
+1. `Variant.hpp` is from [qicosmos/cosmos](https://github.com/qicosmos/cosmos), add add some comments and other changes
+
+1. `Properties.h/cpp` is from [quantcast/qfs](https://github.com/quantcast/qfs), and add some comments and other changes
+
+
+### 友情链接
+1. [openctp](http://www.openctp.cn/) - 以CTP生态为依托的技术服务平台，支持CTP程序无缝接入CTP股票期权、中泰XTP、易盛TAP、华鑫奇点、量投QDP等柜台。
+2. [景色CTP系列文章](https://blog.csdn.net/pjjing/category_6523357.html)
+3. [量化开源基金会](https://github.com/yutiansut/quant-fund)
+4. [SimNow模拟/CTP API 下载](https://www.simnow.com.cn/)
+
 

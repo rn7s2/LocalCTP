@@ -1,5 +1,6 @@
 ﻿#include "stdafx.h"
 #include "LocalTraderApi.h"
+#include "Properties.h"
 #include <iostream>
 
 using namespace localCTP;
@@ -17,6 +18,102 @@ using namespace localCTP;
 
 #define CREATE_SQL_TABLE(tableName) sqlHandler.CreateTable(tableName##Wrapper::CREATE_TABLE_SQL, #tableName);
 
+
+LocalCTPConfig getParamsFromConfig()
+{
+    static bool isFirstTimeLoad(true);
+    static LocalCTPConfig ret;
+    if (isFirstTimeLoad)
+    {
+        auto loadConfigFile = [&] {
+            std::ifstream ifs("localctp.config");
+            Properties prop;
+            prop.loadProperties(ifs, '=', false);
+
+            int running_mode = prop.getValue("running_mode", 0);
+            if (running_mode == 0)
+            {
+                ret.running_mode = RUNNING_MODE::REALTIME_MODE;
+            }
+            else if (running_mode == 1)
+            {
+                ret.running_mode = RUNNING_MODE::BACKTEST_MODE;
+            }
+            else
+            {
+                ret.running_mode = RUNNING_MODE::REALTIME_MODE;
+            }
+
+            std::string backtest_startdate = prop.getValue("backtest_startdate", std::string());
+            if (!backtest_startdate.empty())
+            {
+                ret.backtest_startdate.SetDateTime(
+                    std::stoi(backtest_startdate.substr(0, 4)),//2025 in "20250326"
+                    std::stoi(backtest_startdate.substr(4, 2)),//3 in "20250326"
+                    std::stoi(backtest_startdate.substr(6, 2)),//26 in "20250326"
+                    0,
+                    0,
+                    0
+                );
+            }
+
+            int exit_after_settlement = prop.getValue("exit_after_settlement", 0);
+            if (exit_after_settlement == 0)
+            {
+                ret.exit_after_settlement = false;
+            }
+            else
+            {
+                ret.exit_after_settlement = true;
+            }
+
+            std::string settlement_time = prop.getValue("settlement_time", std::string("17:00:00"));
+            if (settlement_time.size() != 8)
+            {
+                std::cerr << "length of settlement_time param should be 8, for example: 17:00:00" << std::endl;
+                std::exit(1);
+            }
+            ret.settlement_time = settlement_time;
+
+            std::cout << "[LocalCTP] Load local config file, running_mode:" << running_mode
+                << "(" << ret.running_mode << ")"
+                << ", backtest_startdate:" << backtest_startdate
+                << ", exit_after_settlement:" << exit_after_settlement
+                << ", settlement_time:" << settlement_time
+                << std::endl;
+            if (RUNNING_MODE::BACKTEST_MODE == ret.running_mode)
+            {
+                std::cout << "[LocalCTP] Note: You are in " << RUNNING_MODE::BACKTEST_MODE
+                    << ", it will delete all account data in database at the beginning!"
+                    << " If you want to use " << RUNNING_MODE::REALTIME_MODE
+                    << ", set running_mode=0 in config file (localctp.config)" << std::endl;
+            }
+        };
+        loadConfigFile();
+
+        isFirstTimeLoad = false;
+    }
+    return ret;
+}
+
+RUNNING_MODE getRunningModeFromConfig()
+{
+    return getParamsFromConfig().running_mode;
+}
+CLeeDateTime getDefaultTimeInBackTestModeFromConfig()
+{
+    return getParamsFromConfig().backtest_startdate;
+}
+bool getExitAfterSettlementFromConfig()
+{
+    return getParamsFromConfig().exit_after_settlement;
+}
+std::string getSettlementTimeFromConfig()
+{
+    return getParamsFromConfig().settlement_time;
+}
+
+
 std::set<CLocalTraderApi::SP_TRADE_API> CLocalTraderApi::trade_api_set;
 std::atomic<int> CLocalTraderApi::maxSessionID(0);
 std::map<std::string, long long> CLocalTraderApi::m_orderSysID; // 当前最大委托编号
@@ -24,17 +121,21 @@ std::map<std::string, long long> CLocalTraderApi::m_tradeID; // 当前最大成�
 CLocalTraderApi::InstrMap CLocalTraderApi::m_instrData; //合约数据
 std::map<std::string, CThostFtdcExchangeField> CLocalTraderApi::m_exchanges;// 交易所数据. key:交易所代码
 std::map<std::string, CThostFtdcProductField> CLocalTraderApi::m_products;// 品种数据. key:品种代码
+CSettlementHandler& CLocalTraderApi::settlementHandler =
+    CSettlementHandler::getSettlementHandler( CLocalTraderApi::sqlHandler);
+std::mutex CLocalTraderApi::m_mdMtx;
+CLocalTraderApi::MarketDataMap CLocalTraderApi::m_mdData; //行情数据
+const RUNNING_MODE CLocalTraderApi::m_runningMode = getRunningModeFromConfig();
+const bool CLocalTraderApi::m_exitAfterSettlement = getExitAfterSettlementFromConfig();
+const std::string CLocalTraderApi::m_settlementTime = getSettlementTimeFromConfig();
+const CLeeDateTime CLocalTraderApi::m_defaultTimeInBackTestMode = getDefaultTimeInBackTestModeFromConfig();
+CLeeDateTime CLocalTraderApi::m_latestMarketTime;//行情中最新的时间
 CSqliteHandler CLocalTraderApi::sqlHandler("LocalCTP.db", {
     "CThostFtdcInvestorPositionField", "CThostFtdcInvestorPositionDetailField",  "CThostFtdcOrderField",
     "CThostFtdcTradeField", "CThostFtdcTradingAccountField", "CThostFtdcInstrumentField",
     "CThostFtdcInstrumentMarginRateField", "CThostFtdcInstrumentCommissionRateField",
     "CloseDetail", "SettlementData"
-});
-CLocalTraderApi::CSettlementHandler& CLocalTraderApi::settlementHandler =
-    CLocalTraderApi::CSettlementHandler::getSettlementHandler(
-        CLocalTraderApi::sqlHandler);
-std::mutex CLocalTraderApi::m_mdMtx;
-CLocalTraderApi::MarketDataMap CLocalTraderApi::m_mdData; //行情数据
+    });
 const long long CLocalTraderApi::initStartTime = CLeeDateTime::GetCurrentTime().Get_time_t() * 1000 +
      CLeeDateTime::GetCurrentTime().GetMillisecond(); // 1612345678 999
 std::string CLocalTraderApi::tradingDay;
@@ -84,7 +185,7 @@ bool CLocalTraderApi::isMatchTrade(TThostFtdcDirectionType direction, double ord
         // 组合合约示例: m2401-m2405 组合合约.买入报单价480元.
         // m2401 买一价3998元,卖一价4000元.
         // m2405 买一价3500元,卖一价3505元.
-        // 则买入对应的组合合约对手价(卖一价差)是: 4000-3500=500元. 500>480,可以成交.
+        // 则买入对应的组合合约对手价(卖一价差)是: 4000-3500=500元. 500>480,无法成交.
         for (std::size_t legNo = 0; legNo < mdVec.size(); ++legNo)
         {
             auto directionT = (legNo % 2 == 0 ?
@@ -111,14 +212,16 @@ bool CLocalTraderApi::isMatchTrade(TThostFtdcDirectionType direction, double ord
 CLocalTraderApi::CLocalTraderApi(const char *pszFlowPath/* = ""*/)
 	: m_bRunning(false), m_authenticated(false), m_logined(false)
     , m_frontID(static_cast<int>(CLeeDateTime::GetCurrentTime().Get_time_t())), m_sessionID(0)
-    , m_tradingAccount{ 0 }, m_pSpi(nullptr)
+    , m_tradingAccount{ 0 }, m_messageQueue()
     , m_successRspInfo{ 0, "success" }, m_errorRspInfo{ -1, "error" }
 {
     m_tradingAccount.PreBalance = 2e7;
     m_tradingAccount.Balance = 2e7;
 
+
+
 #ifdef _DEBUG
-    std::cout << "Welcome to LocalCTP!" << std::endl;
+    std::cout << "[LocalCTP] Welcome to LocalCTP!" << std::endl;
 #endif
 }
 
@@ -147,6 +250,51 @@ void CLocalTraderApi::onSnapshot(const CThostFtdcDepthMarketDataField& mdData)
     {
         std::lock_guard<std::mutex> mdGuard(m_mdMtx);
         m_mdData[instrumentID] = mdData;
+    }
+    {
+        //更新回测模式中的当前时间
+        const std::string updateTimeStr = mdData.UpdateTime; //"21:55:59"
+        if (updateTimeStr.size() < 8)
+        {
+            return;
+        }
+        CLeeDateTime updateTime;
+        if (std::stoi(updateTimeStr.substr(0, 2)) >= 20) //夜盘行情时间
+        {
+            const std::string minDayStr = (std::min)(std::string(mdData.ActionDay), std::string(mdData.TradingDay)); //"20250313"
+            if (tradingDay.empty() || minDayStr.size() < 8) return;
+            updateTime.SetDateTime(std::stoi(minDayStr.substr(0, 4)),
+                std::stoi(minDayStr.substr(4, 2)),
+                std::stoi(minDayStr.substr(6, 2)),
+                std::stoi(updateTimeStr.substr(0, 2)),
+                std::stoi(updateTimeStr.substr(3, 2)),
+                std::stoi(updateTimeStr.substr(6, 2)),
+                mdData.UpdateMillisec);
+            if (minDayStr < tradingDay)
+            {
+            }
+            else //说明 ActionDay和TradingDay 的较小者仍不为当前实际日期, 则需要求出交易日的前一天作为当前实际日期
+            {
+                while (!isTradingDay(updateTime))
+                {
+                    updateTime -= CLeeDateTimeSpan(1, 0, 0, 0);
+                }
+            }
+        }
+        else
+        {
+            updateTime.SetDateTime(std::stoi(tradingDay.substr(0, 4)),
+                std::stoi(tradingDay.substr(4, 2)),
+                std::stoi(tradingDay.substr(6, 2)),
+                std::stoi(updateTimeStr.substr(0, 2)),
+                std::stoi(updateTimeStr.substr(3, 2)),
+                std::stoi(updateTimeStr.substr(6, 2)),
+                mdData.UpdateMillisec);
+        }
+        if (updateTime > m_latestMarketTime)
+        {
+            m_latestMarketTime = updateTime;
+        }
     }
 
     auto it = m_instrData.find(instrumentID);
@@ -260,6 +408,20 @@ void CLocalTraderApi::onSnapshot(const CThostFtdcDepthMarketDataField& mdData)
         mdData.SettlementPrice : mdData.LastPrice;//优先使用结算价进行计算
     double diffPositionProfit(0);
     CSqliteTransactionHandler transactionHandle(sqlHandler);
+    static size_t mdDataCounter = 0;
+    bool shouldUpdateSql = true;
+    if (CLocalTraderApi::m_runningMode == RUNNING_MODE::BACKTEST_MODE)
+    {
+        if (++mdDataCounter >= 100)
+        {
+            mdDataCounter = 0;
+            shouldUpdateSql = true;
+        }
+        else
+        {
+            shouldUpdateSql = false;
+        }
+    }
     for (auto dir : { THOST_FTDC_D_Buy, THOST_FTDC_D_Sell })
     {
         for (auto dateType : { THOST_FTDC_PSD_Today, THOST_FTDC_PSD_History })
@@ -314,7 +476,10 @@ void CLocalTraderApi::onSnapshot(const CThostFtdcDepthMarketDataField& mdData)
                         + "' AND OpenDate='" + posDetail.OpenDate
                         + "' AND TradeID='" + posDetail.TradeID
                         + "';";
-                    sqlHandler.Update(updatePositionDetailProfitSql);
+                    if (shouldUpdateSql)
+                    {
+                        sqlHandler.Update(updatePositionDetailProfitSql);
+                    }
                 }
 
                 //行情没变化则不更新
@@ -348,20 +513,23 @@ void CLocalTraderApi::onSnapshot(const CThostFtdcDepthMarketDataField& mdData)
                     + "' AND InstrumentID='" + itPos->second.pos.InstrumentID
                     + "' AND PosiDirection='" + itPos->second.pos.PosiDirection
                     + "' AND PositionDate='" + itPos->second.pos.PositionDate + "';";
-                sqlHandler.Update(updatePositionProfitSql);
+                if (shouldUpdateSql)
+                {
+                    sqlHandler.Update(updatePositionProfitSql);
+                }
             }
         }
     }
     m_tradingAccount.PositionProfit += diffPositionProfit;
     if (NEZ(diffPositionProfit))
     {
-        updatePNL();
+        updatePNL(false, shouldUpdateSql);
     }
 }
 
 
 // 计算PNL(profit and loss, 盈亏)
-void CLocalTraderApi::updatePNL(bool needTotalCalc /*= false*/)
+void CLocalTraderApi::updatePNL(bool needTotalCalc /*= false*/, bool shouldUpdateSql /*= true*/)
 {
     if (needTotalCalc)
     {
@@ -393,7 +561,10 @@ void CLocalTraderApi::updatePNL(bool needTotalCalc /*= false*/)
         - m_tradingAccount.FrozenCash;
 
     // PNL更新时保存资金数据到数据库中. 可根据需要修改控制保存的时机(如定时保存等).
-    saveTradingAccountToDb();
+    if (shouldUpdateSql)
+    {
+        saveTradingAccountToDb();
+    }
 }
 
 void CLocalTraderApi::updateByCancel(const CThostFtdcOrderField& o)
@@ -873,7 +1044,7 @@ void CLocalTraderApi::reloadAccountData()
             m_instrumentMarginRateData[marginRate.data.InstrumentID] = marginRate.data;
         }
 #ifdef _DEBUG
-        std::cout << "Total instrument marinRate count from table in database: "
+        std::cout << "[LocalCTP] Total instrument marinRate count from table in database: "
             << marinRateSqlValues.size() << std::endl;
 #endif
         CSqliteHandler::SQL_VALUES commissionRateSqlValues;
@@ -885,7 +1056,7 @@ void CLocalTraderApi::reloadAccountData()
             m_instrumentCommissionRateData[commissionRate.data.InstrumentID] = commissionRate.data;
         }
 #ifdef _DEBUG
-        std::cout << "Total instrument CommissionRate count from table in database: "
+        std::cout << "[LocalCTP] Total instrument CommissionRate count from table in database: "
             << commissionRateSqlValues.size() << std::endl;
 #endif
     };
@@ -1057,6 +1228,27 @@ void CLocalTraderApi::saveOrderToDb(const CThostFtdcOrderField& order)
 ///@param pszFlowPath 存贮订阅信息文件的目录，默认为当前目录
 ///@return 创建出的UserApi
 CThostFtdcTraderApi* CThostFtdcTraderApi::CreateFtdcTraderApi(const char *pszFlowPath/* = ""*/) {
+    if (CLocalTraderApi::trade_api_set.empty())
+    {
+        CLocalTraderApi::initInstrMap();
+
+        if (CLocalTraderApi::m_runningMode == RUNNING_MODE::BACKTEST_MODE)
+        {
+            //回测模式下会先删除数据库中所有交易数据.
+            auto deleteAllAccountDataInDB = [&]() {
+                const std::vector<std::string> toBeDeletedTables{
+                    "CThostFtdcInvestorPositionField", "CThostFtdcInvestorPositionDetailField",
+                    "CThostFtdcOrderField","CThostFtdcTradeField", "CThostFtdcTradingAccountField",
+                    "CloseDetail", "SettlementData" };
+                for (const auto& tableName : toBeDeletedTables)
+                {
+                    const std::string deleteTableSql = "DELETE FROM '" + tableName + "';";
+                    CLocalTraderApi::sqlHandler.Delete(deleteTableSql);
+                }
+            };
+            deleteAllAccountDataInDB();
+        }
+    }
 	auto sp_this = std::make_shared<CLocalTraderApi>(pszFlowPath);
     CLocalTraderApi::trade_api_set.insert(sp_this);
 	return sp_this.get();
@@ -1126,7 +1318,7 @@ void CLocalTraderApi::initInstrMap()
             m_instrData[instr.InstrumentID] = instr;
         }
 #ifdef _DEBUG
-        std::cout << "Total instrument count from instrument.csv: " << m_instrData.size() << std::endl;
+        std::cout << "[LocalCTP] Total instrument count from instrument.csv: " << m_instrData.size() << std::endl;
 #endif
         return true;
     };
@@ -1141,7 +1333,7 @@ void CLocalTraderApi::initInstrMap()
         m_instrData[instrument.data.InstrumentID] = instrument.data;
     }
 #ifdef _DEBUG
-    std::cout << "Total instrument count from instrument table in database: "
+    std::cout << "[LocalCTP] Total instrument count from instrument table in database: "
         << instrumentSqlValues.size() << std::endl;
 #endif
     // 将从csv文件获取的合约数据,重新写入数据库中
@@ -1235,7 +1427,6 @@ void CLocalTraderApi::initInstrMap()
 ///@remark 初始化运行环境,只有调用后,接口才开始工作
 void CLocalTraderApi::Init() {
     m_bRunning = true;
-    CLocalTraderApi::initInstrMap();
 
     // 从数据库中读取合约的保证金率和手续费.
     // 临时措施:对数据库中没有数据的合约,将合约的保证金率和手续费率初始化(保证金率为10%,手续费为1元每手)
@@ -1260,10 +1451,7 @@ void CLocalTraderApi::Init() {
     };
     initializeCommissionRateAndMarginRate();
 
-
-    if (m_pSpi == nullptr) return;
-
-    m_pSpi->OnFrontConnected();
+    m_messageQueue.addMsg(OnFrontConnectedMsg());
     return;
 }
 
@@ -1274,12 +1462,27 @@ int CLocalTraderApi::Join() {
 	return 0;
 }
 
-///获取当前交易日
-///@retrun 获取到的交易日
-///@remark 只有登录成功后,才能得到正确的交易日
-const char* CLocalTraderApi::GetTradingDay() {
+CLeeDateTime CLocalTraderApi::getNowTime()
+{
+    switch (m_runningMode)
+    {
+    case RUNNING_MODE::REALTIME_MODE:
+        return CLeeDateTime::now();
+    case RUNNING_MODE::BACKTEST_MODE:
+        return (m_latestMarketTime == CLeeDateTime() ?
+            m_defaultTimeInBackTestMode : m_latestMarketTime);
+    case RUNNING_MODE::NONE:
+    default:
+        return CLeeDateTime::now();
+    }
+}
+
+const char* CLocalTraderApi::StaticGetTradingDay() {
+    static std::mutex tradingDayMutex;
+    std::lock_guard<std::mutex> tradingDayGuard(tradingDayMutex);
     if (CLocalTraderApi::tradingDay.empty())
     {
+        std::cout << "[LocalCTP] tradingDay is empty, let's init it!" << std::endl;
         auto getRawTradingDay = []() ->std::string
         {
             // use ( now time + 4 hours) as trading date,
@@ -1288,7 +1491,7 @@ const char* CLocalTraderApi::GetTradingDay() {
             // 1. 2023-08-07 10:00 -> 2023-08-07 14:00 -> return "20230807"
             // 2. 2023-08-07 20:00 -> 2023-08-08 02:00 -> return "20230808"
             // 3. 2023-08-04 20:00(Fri) -> 2023-08-05 02:00(Sat) -> 2023-08-07 02:00(Mon) -> return "20230807"
-            auto checkTime = CLeeDateTime::now() + CLeeDateTimeSpan(0, 4, 0, 0);
+            auto checkTime = CLocalTraderApi::getNowTime() + CLeeDateTimeSpan(0, 4, 0, 0);
             if (isTradingDay(checkTime))
             {
                 return checkTime.Format("%Y%m%d");
@@ -1299,6 +1502,14 @@ const char* CLocalTraderApi::GetTradingDay() {
             }
         };
         const std::string rawTradingDay = getRawTradingDay();
+        if (CLocalTraderApi::m_runningMode == RUNNING_MODE::BACKTEST_MODE)
+        {
+            //回测模式下初始化时不读取数据库结算单表来设置交易日,
+            //也就是说即使结算单表中有当天日期的结算单, 仍然会以当天(而非下一天)作为交易日.
+            //(不过现在回测模式下启动时会将数据库里所有账户数据清空,因此其实并不会发生上述情况)
+            CLocalTraderApi::tradingDay = rawTradingDay;
+            return CLocalTraderApi::tradingDay.c_str();;
+        }
         CSqliteHandler::SQL_VALUES sqlValues;
         auto selectRet = CLocalTraderApi::sqlHandler.SelectData(
             "SELECT TradingDay FROM 'SettlementData' ORDER BY TradingDay DESC LIMIT 1;",
@@ -1320,6 +1531,12 @@ const char* CLocalTraderApi::GetTradingDay() {
         }
     }
     return CLocalTraderApi::tradingDay.c_str();
+}
+
+///获取当前交易日
+///@retrun 获取到的交易日
+const char* CLocalTraderApi::GetTradingDay() {
+    return CLocalTraderApi::StaticGetTradingDay();
 }
 
 ///注册前置机网络地址
@@ -1350,7 +1567,7 @@ void CLocalTraderApi::RegisterFensUserInfo(CThostFtdcFensUserInfoField* pFensUse
 ///注册回调接口
 ///@param pSpi 派生自回调接口类的实例
 void CLocalTraderApi::RegisterSpi(CThostFtdcTraderSpi *pSpi) {
-    m_pSpi = pSpi;
+    m_messageQueue.RegisterSpi(pSpi);
     return;
 }
 
@@ -1379,15 +1596,13 @@ int CLocalTraderApi::ReqAuthenticate(CThostFtdcReqAuthenticateField *pReqAuthent
     if (strlen(pReqAuthenticateField->UserID) == 0 ||
         strlen(pReqAuthenticateField->BrokerID) == 0)
     {
-        if (m_pSpi == nullptr) return 0;
-        m_pSpi->OnRspAuthenticate(&RspAuthenticateField, setErrorMsgAndGetRspInfo(ErrMsgUserInfoIsEmpty), nRequestID, true);
+        m_messageQueue.addMsg(OnRspAuthenticateMsg(&RspAuthenticateField, setErrorMsgAndGetRspInfo(ErrMsgUserInfoIsEmpty), nRequestID, true));
         return 0;
     }
     if ((!m_userID.empty() && m_userID != pReqAuthenticateField->UserID) ||
         (!m_brokerID.empty() && m_brokerID != pReqAuthenticateField->BrokerID))
     {
-        if (m_pSpi == nullptr) return 0;
-        m_pSpi->OnRspAuthenticate(&RspAuthenticateField, setErrorMsgAndGetRspInfo(ErrMsgUserInfoNotSameAsLastTime), nRequestID, true);
+        m_messageQueue.addMsg(OnRspAuthenticateMsg(&RspAuthenticateField, setErrorMsgAndGetRspInfo(ErrMsgUserInfoNotSameAsLastTime), nRequestID, true));
         return 0;
     }
 
@@ -1396,8 +1611,7 @@ int CLocalTraderApi::ReqAuthenticate(CThostFtdcReqAuthenticateField *pReqAuthent
     m_brokerID = pReqAuthenticateField->BrokerID;
     strncpy(m_tradingAccount.AccountID, pReqAuthenticateField->UserID, sizeof(m_tradingAccount.AccountID));
     strncpy(m_tradingAccount.BrokerID, pReqAuthenticateField->BrokerID, sizeof(m_tradingAccount.BrokerID));
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspAuthenticate(&RspAuthenticateField, &m_successRspInfo, nRequestID, true);
+    m_messageQueue.addMsg(OnRspAuthenticateMsg(&RspAuthenticateField, &m_successRspInfo, nRequestID, true));
     return 0;
 }
 
@@ -1412,23 +1626,21 @@ int CLocalTraderApi::ReqUserLogin(CThostFtdcReqUserLoginField *pReqUserLoginFiel
     strncpy(RspUserLogin.UserID, pReqUserLoginField->UserID, sizeof(RspUserLogin.UserID));
     if (!m_authenticated)
     {
-        if (m_pSpi == nullptr) return 0;
-        m_pSpi->OnRspUserLogin(&RspUserLogin, setErrorMsgAndGetRspInfo(ErrMsgNotAuth), nRequestID, true);
+        m_messageQueue.addMsg(OnRspUserLoginMsg(&RspUserLogin, setErrorMsgAndGetRspInfo(ErrMsgNotAuth), nRequestID, true));
         return 0;
     }
     if (m_userID != pReqUserLoginField->UserID || m_brokerID != pReqUserLoginField->BrokerID)
     {
-        if (m_pSpi == nullptr) return 0;
-        m_pSpi->OnRspUserLogin(&RspUserLogin, setErrorMsgAndGetRspInfo(ErrMsgUserInfoNotSameAsAuth), nRequestID, true);
+        m_messageQueue.addMsg(OnRspUserLoginMsg(&RspUserLogin, setErrorMsgAndGetRspInfo(ErrMsgUserInfoNotSameAsAuth), nRequestID, true));
         return 0;
     }
     m_logined = true;
     //加载账户的数据
     reloadAccountData();
 
-    if (m_pSpi == nullptr) return 0;
     strncpy(RspUserLogin.TradingDay, GetTradingDay(), sizeof(RspUserLogin.TradingDay));
-    strncpy(RspUserLogin.LoginTime, CLeeDateTime::GetCurrentTime().Format("%H:%M:%S").c_str(),
+    strncpy(RspUserLogin.LoginTime, CLocalTraderApi::getNowTime() //CLeeDateTime::GetCurrentTime()
+        .Format("%H:%M:%S").c_str(),
         sizeof(RspUserLogin.LoginTime));
     strncpy(RspUserLogin.SHFETime, RspUserLogin.LoginTime, sizeof(RspUserLogin.SHFETime));
     strncpy(RspUserLogin.DCETime, RspUserLogin.LoginTime, sizeof(RspUserLogin.DCETime));
@@ -1440,7 +1652,7 @@ int CLocalTraderApi::ReqUserLogin(CThostFtdcReqUserLoginField *pReqUserLoginFiel
     RspUserLogin.FrontID = m_frontID;
     m_sessionID = maxSessionID++;
     RspUserLogin.SessionID = m_sessionID;
-    m_pSpi->OnRspUserLogin(&RspUserLogin, &m_successRspInfo, nRequestID, true);
+    m_messageQueue.addMsg(OnRspUserLoginMsg(&RspUserLogin, &m_successRspInfo, nRequestID, true));
     return 0;
 }
 
@@ -1451,15 +1663,14 @@ int CLocalTraderApi::ReqUserLogout(CThostFtdcUserLogoutField *pUserLogout, int n
 
     m_authenticated = false;
     m_logined = false;
-    if (m_pSpi == nullptr) return 0;
     CThostFtdcUserLogoutField RspUserLogout = { 0 };
     strncpy(RspUserLogout.UserID, pUserLogout->UserID, sizeof(RspUserLogout.UserID));
     strncpy(RspUserLogout.BrokerID, pUserLogout->BrokerID, sizeof(RspUserLogout.BrokerID));
-    m_pSpi->OnRspUserLogout(&RspUserLogout, &m_successRspInfo, nRequestID, true);
+    m_messageQueue.addMsg(OnRspUserLogoutMsg(&RspUserLogout, &m_successRspInfo, nRequestID, true));
 #if 0
     //另一种方案:不允许登出. "上了车还想跑? 车门已焊死!"
-    m_pSpi->OnRspUserLogout(&RspUserLogout, &setErrorMsgAndGetRspInfo("Logout is not supported in this system."),
-        nRequestID, true);
+    m_messageQueue.addMsg(OnRspUserLogoutMsg(&RspUserLogout, &setErrorMsgAndGetRspInfo("Logout is not supported in this system."),
+        nRequestID, true));
 #endif
     return 0;
 }
@@ -1467,20 +1678,18 @@ int CLocalTraderApi::ReqUserLogout(CThostFtdcUserLogoutField *pUserLogout, int n
 ///用户口令更新请求
 int CLocalTraderApi::ReqUserPasswordUpdate(CThostFtdcUserPasswordUpdateField *pUserPasswordUpdate, int nRequestID) {
     CHECK_LOGIN_USER(pUserPasswordUpdate);
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspUserPasswordUpdate(nullptr,
+    m_messageQueue.addMsg(OnRspUserPasswordUpdateMsg(nullptr,
         setErrorMsgAndGetRspInfo("Update password is not supported in this system."),
-        nRequestID, true);
+        nRequestID, true));
     return 0;
 }
 
 ///资金账户口令更新请求
 int CLocalTraderApi::ReqTradingAccountPasswordUpdate(CThostFtdcTradingAccountPasswordUpdateField *pTradingAccountPasswordUpdate, int nRequestID) {
     CHECK_LOGIN_ACCOUNT(pTradingAccountPasswordUpdate);
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspTradingAccountPasswordUpdate(nullptr,
+    m_messageQueue.addMsg(OnRspTradingAccountPasswordUpdateMsg(nullptr,
         setErrorMsgAndGetRspInfo("Update password is not supported in this system."),
-        nRequestID, true);
+        nRequestID, true));
     return 0;
 }
 
@@ -1493,8 +1702,8 @@ int CLocalTraderApi::ReqOrderInsertImpl(CThostFtdcInputOrderField * pInputOrder,
     CHECK_LOGIN_INVESTOR(pInputOrder);
     SHOW_TIME(StartOrder)
     const auto sendRejectOrder = [&](const char* errMsg) {
-        m_pSpi->OnRspOrderInsert(pInputOrder, setErrorMsgAndGetRspInfo(errMsg), nRequestID, true);
-        m_pSpi->OnErrRtnOrderInsert(pInputOrder, setErrorMsgAndGetRspInfo(errMsg));
+        m_messageQueue.addMsg(OnRspOrderInsertMsg(pInputOrder, setErrorMsgAndGetRspInfo(errMsg), nRequestID, true));
+        m_messageQueue.addMsg(OnErrRtnOrderInsertMsg(pInputOrder, setErrorMsgAndGetRspInfo(errMsg)));
     };
 
     if (pInputOrder->VolumeTotalOriginal <= 0)
@@ -1932,20 +2141,18 @@ int CLocalTraderApi::ReqOrderInsertImpl(CThostFtdcInputOrderField * pInputOrder,
 ///预埋单录入请求
 int CLocalTraderApi::ReqParkedOrderInsert(CThostFtdcParkedOrderField *pParkedOrder, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pParkedOrder);
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspParkedOrderInsert(nullptr,
+    m_messageQueue.addMsg(OnRspParkedOrderInsertMsg(nullptr,
         setErrorMsgAndGetRspInfo("Parked order is not supported in this system."),
-        nRequestID, true);
+        nRequestID, true));
     return 0;
 }
 
 ///预埋撤单录入请求
 int CLocalTraderApi::ReqParkedOrderAction(CThostFtdcParkedOrderActionField *pParkedOrderAction, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pParkedOrderAction);
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspParkedOrderAction(nullptr,
+    m_messageQueue.addMsg(OnRspParkedOrderActionMsg(nullptr,
         setErrorMsgAndGetRspInfo("Parked order is not supported in this system."),
-        nRequestID, true);
+        nRequestID, true));
     return 0;
 }
 
@@ -1955,8 +2162,7 @@ int CLocalTraderApi::ReqOrderAction(CThostFtdcInputOrderActionField *pInputOrder
 
     if (pInputOrderAction->ActionFlag != THOST_FTDC_AF_Delete)
     {
-        if (m_pSpi == nullptr) return 0;
-        m_pSpi->OnRspOrderAction(pInputOrderAction, setErrorMsgAndGetRspInfo(ErrMsg_NotSupportModifyOrder), nRequestID, true);
+        m_messageQueue.addMsg(OnRspOrderActionMsg(pInputOrderAction, setErrorMsgAndGetRspInfo(ErrMsg_NotSupportModifyOrder), nRequestID, true));
         return 0;
     }
     const auto sessionKey = generateSessionKey(pInputOrderAction->FrontID, pInputOrderAction->SessionID);
@@ -1976,10 +2182,9 @@ int CLocalTraderApi::ReqOrderAction(CThostFtdcInputOrderActionField *pInputOrder
                     order.rtnOrder.SessionID != pInputOrderAction->SessionID ||
                     strcmp(order.rtnOrder.InstrumentID, pInputOrderAction->InstrumentID) != 0)
                 {
-                    if (m_pSpi == nullptr) return 0;
-                    m_pSpi->OnRspOrderAction(pInputOrderAction, setErrorMsgAndGetRspInfo(
+                    m_messageQueue.addMsg(OnRspOrderActionMsg(pInputOrderAction, setErrorMsgAndGetRspInfo(
                         order.isDone() ? ErrMsg_AlreadyDoneOrder : ErrMsg_NotExistOrder),
-                        nRequestID, true);
+                        nRequestID, true));
                     return 0;
                 }
                 else
@@ -2004,25 +2209,23 @@ int CLocalTraderApi::ReqOrderAction(CThostFtdcInputOrderActionField *pInputOrder
             }
         }
     }
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspOrderAction(pInputOrderAction, setErrorMsgAndGetRspInfo(ErrMsg_NotExistOrder), nRequestID, true);
+    m_messageQueue.addMsg(OnRspOrderActionMsg(pInputOrderAction, setErrorMsgAndGetRspInfo(ErrMsg_NotExistOrder), nRequestID, true));
     return 0;
 }
 
 /////查询最大报单数量请求
 //int CLocalTraderApi::ReqQryMaxOrderVolume(CThostFtdcQryMaxOrderVolumeField *pQryMaxOrderVolume, int nRequestID) {
 //    CHECK_LOGIN_INVESTOR(pQryMaxOrderVolume);
-//    if (m_pSpi == nullptr) return 0;
-//    m_pSpi->OnRspQryMaxOrderVolume(nullptr,
+//    m_messageQueue.addMsg(OnRspQryMaxOrderVolumeMsg(nullptr,
 //        setErrorMsgAndGetRspInfo("Query MaxOrderVolume is not supported in this system."),
-//        nRequestID, true);
+//        nRequestID, true));
 //    return 0;
 //}
 
 ///投资者结算结果确认
 int CLocalTraderApi::ReqSettlementInfoConfirm(CThostFtdcSettlementInfoConfirmField *pSettlementInfoConfirm, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pSettlementInfoConfirm);
-    const auto nowTime = CLeeDateTime::GetCurrentTime();
+    const auto nowTime = CLocalTraderApi::getNowTime(); //CLeeDateTime::GetCurrentTime();
     //更新最新的交易日的结算结果确认信息
     const std::string UPDATE_NEWEST_SETTLEMENT_RECORD_TO_CONFIRMED =
         std::string("UPDATE 'SettlementData' SET ConfirmDay='") + GetTradingDay()
@@ -2033,36 +2236,32 @@ int CLocalTraderApi::ReqSettlementInfoConfirm(CThostFtdcSettlementInfoConfirmFie
     CSqliteHandler::SQL_VALUES posSqlValues;
     sqlHandler.Update(UPDATE_NEWEST_SETTLEMENT_RECORD_TO_CONFIRMED);
 
-    if (m_pSpi == nullptr) return 0;
     CThostFtdcSettlementInfoConfirmField SettlementInfoConfirm = *pSettlementInfoConfirm;
-    m_pSpi->OnRspSettlementInfoConfirm(&SettlementInfoConfirm, &m_successRspInfo, nRequestID, true);
+    m_messageQueue.addMsg(OnRspSettlementInfoConfirmMsg(&SettlementInfoConfirm, &m_successRspInfo, nRequestID, true));
     return 0;
 }
 
 ///请求删除预埋单
 int CLocalTraderApi::ReqRemoveParkedOrder(CThostFtdcRemoveParkedOrderField *pRemoveParkedOrder, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pRemoveParkedOrder);
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspRemoveParkedOrder(nullptr,
+    m_messageQueue.addMsg(OnRspRemoveParkedOrderMsg(nullptr,
         setErrorMsgAndGetRspInfo("Parked order is not supported in this system."),
-        nRequestID, true);
+        nRequestID, true));
     return 0;
 }
 
 ///请求删除预埋撤单
 int CLocalTraderApi::ReqRemoveParkedOrderAction(CThostFtdcRemoveParkedOrderActionField *pRemoveParkedOrderAction, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pRemoveParkedOrderAction);
-    if (m_pSpi == nullptr) return 0;
-    m_pSpi->OnRspRemoveParkedOrderAction(nullptr,
+    m_messageQueue.addMsg(OnRspRemoveParkedOrderActionMsg(nullptr,
         setErrorMsgAndGetRspInfo("Parked order is not supported in this system."),
-        nRequestID, true);
+        nRequestID, true));
     return 0;
 }
 
 ///请求查询报单
 int CLocalTraderApi::ReqQryOrder(CThostFtdcQryOrderField *pQryOrder, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQryOrder);
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcOrderField*> v;
     {
         std::lock_guard<std::mutex> orderGuard(m_orderMtx);
@@ -2082,11 +2281,11 @@ int CLocalTraderApi::ReqQryOrder(CThostFtdcQryOrderField *pQryOrder, int nReques
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryOrder(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryOrderMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryOrder(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryOrderMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2094,7 +2293,6 @@ int CLocalTraderApi::ReqQryOrder(CThostFtdcQryOrderField *pQryOrder, int nReques
 ///请求查询成交
 int CLocalTraderApi::ReqQryTrade(CThostFtdcQryTradeField *pQryTrade, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQryTrade);
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcTradeField*> v;
     {
         std::lock_guard<std::mutex> orderGuard(m_orderMtx);
@@ -2116,11 +2314,11 @@ int CLocalTraderApi::ReqQryTrade(CThostFtdcQryTradeField *pQryTrade, int nReques
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryTrade(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryTradeMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryTrade(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryTradeMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2128,7 +2326,6 @@ int CLocalTraderApi::ReqQryTrade(CThostFtdcQryTradeField *pQryTrade, int nReques
 ///请求查询投资者持仓
 int CLocalTraderApi::ReqQryInvestorPosition(CThostFtdcQryInvestorPositionField *pQryInvestorPosition, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQryInvestorPosition);
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcInvestorPositionField*> v;
     {
         std::lock_guard<std::mutex> posGuard(m_positionMtx);
@@ -2144,11 +2341,11 @@ int CLocalTraderApi::ReqQryInvestorPosition(CThostFtdcQryInvestorPositionField *
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryInvestorPosition(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryInvestorPositionMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryInvestorPosition(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryInvestorPositionMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2156,32 +2353,29 @@ int CLocalTraderApi::ReqQryInvestorPosition(CThostFtdcQryInvestorPositionField *
 ///请求查询资金账户
 int CLocalTraderApi::ReqQryTradingAccount(CThostFtdcQryTradingAccountField *pQryTradingAccount, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQryTradingAccount);
-    if (m_pSpi == nullptr) return 0;
     strncpy(m_tradingAccount.BrokerID, m_brokerID.c_str(), sizeof(m_tradingAccount.BrokerID));
     strncpy(m_tradingAccount.AccountID, m_userID.c_str(), sizeof(m_tradingAccount.AccountID));
     strncpy(m_tradingAccount.TradingDay, GetTradingDay(), sizeof(m_tradingAccount.TradingDay));
-    m_pSpi->OnRspQryTradingAccount(&m_tradingAccount, &m_successRspInfo, nRequestID, true);
+    m_messageQueue.addMsg(OnRspQryTradingAccountMsg(&m_tradingAccount, &m_successRspInfo, nRequestID, true));
     return 0;
 }
 
 ///请求查询投资者
 int CLocalTraderApi::ReqQryInvestor(CThostFtdcQryInvestorField *pQryInvestor, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQryInvestor);
-    if (m_pSpi == nullptr) return 0;
     CThostFtdcInvestorField Investor = { 0 };
     strncpy(Investor.InvestorID, pQryInvestor->InvestorID, sizeof(Investor.InvestorID));
     strncpy(Investor.BrokerID, pQryInvestor->BrokerID, sizeof(Investor.BrokerID));
     Investor.IdentifiedCardType = THOST_FTDC_ICT_OtherCard;
     strncpy(Investor.IdentifiedCardNo, "QQ1005018695", sizeof(Investor.IdentifiedCardNo));
     Investor.IsActive = 1;
-    m_pSpi->OnRspQryInvestor(&Investor, &m_successRspInfo, nRequestID, true);
+    m_messageQueue.addMsg(OnRspQryInvestorMsg(&Investor, &m_successRspInfo, nRequestID, true));
     return 0;
 }
 
 ///请求查询合约保证金率
 int CLocalTraderApi::ReqQryInstrumentMarginRate(CThostFtdcQryInstrumentMarginRateField *pQryInstrumentMarginRate, int nRequestID) {
     if (pQryInstrumentMarginRate == nullptr || !m_logined) return -1;
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcInstrumentMarginRateField*> v;
     for (auto& instrPair : m_instrumentMarginRateData)
     {
@@ -2194,11 +2388,11 @@ int CLocalTraderApi::ReqQryInstrumentMarginRate(CThostFtdcQryInstrumentMarginRat
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryInstrumentMarginRate(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryInstrumentMarginRateMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryInstrumentMarginRate(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryInstrumentMarginRateMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2206,7 +2400,6 @@ int CLocalTraderApi::ReqQryInstrumentMarginRate(CThostFtdcQryInstrumentMarginRat
 ///请求查询合约手续费率
 int CLocalTraderApi::ReqQryInstrumentCommissionRate(CThostFtdcQryInstrumentCommissionRateField *pQryInstrumentCommissionRate, int nRequestID) {
     if (pQryInstrumentCommissionRate == nullptr || !m_logined) return -1;
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcInstrumentCommissionRateField*> v;
     for (auto& instrPair : m_instrumentCommissionRateData)
     {
@@ -2219,11 +2412,11 @@ int CLocalTraderApi::ReqQryInstrumentCommissionRate(CThostFtdcQryInstrumentCommi
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryInstrumentCommissionRate(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryInstrumentCommissionRateMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryInstrumentCommissionRate(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryInstrumentCommissionRateMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2231,7 +2424,6 @@ int CLocalTraderApi::ReqQryInstrumentCommissionRate(CThostFtdcQryInstrumentCommi
 ///请求查询交易所
 int CLocalTraderApi::ReqQryExchange(CThostFtdcQryExchangeField *pQryExchange, int nRequestID) {
     if (pQryExchange == nullptr || !m_logined) return -1;
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcExchangeField*> v;
     for (auto& e : m_exchanges)
     {
@@ -2242,11 +2434,11 @@ int CLocalTraderApi::ReqQryExchange(CThostFtdcQryExchangeField *pQryExchange, in
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryExchange(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryExchangeMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryInstrument(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryExchangeMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2254,7 +2446,6 @@ int CLocalTraderApi::ReqQryExchange(CThostFtdcQryExchangeField *pQryExchange, in
 ///请求查询产品
 int CLocalTraderApi::ReqQryProduct(CThostFtdcQryProductField *pQryProduct, int nRequestID) {
     if (pQryProduct == nullptr || !m_logined) return -1;
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcProductField*> v;
     for (auto& productPair : m_products)
     {
@@ -2268,11 +2459,11 @@ int CLocalTraderApi::ReqQryProduct(CThostFtdcQryProductField *pQryProduct, int n
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryProduct(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryProductMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryProduct(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryProductMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2280,7 +2471,6 @@ int CLocalTraderApi::ReqQryProduct(CThostFtdcQryProductField *pQryProduct, int n
 ///请求查询合约
 int CLocalTraderApi::ReqQryInstrument(CThostFtdcQryInstrumentField *pQryInstrument, int nRequestID) {
     if (pQryInstrument == nullptr || !m_logined) return -1;
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcInstrumentField*> v;
     v.reserve(1000); // maybe less than this count ?
     for (auto& instrPair : m_instrData)
@@ -2295,11 +2485,11 @@ int CLocalTraderApi::ReqQryInstrument(CThostFtdcQryInstrumentField *pQryInstrume
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryInstrument(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryInstrumentMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryInstrument(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryInstrumentMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2307,7 +2497,6 @@ int CLocalTraderApi::ReqQryInstrument(CThostFtdcQryInstrumentField *pQryInstrume
 ///请求查询行情
 int CLocalTraderApi::ReqQryDepthMarketData(CThostFtdcQryDepthMarketDataField *pQryDepthMarketData, int nRequestID) {
     if (pQryDepthMarketData == nullptr || !m_logined) return -1;
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcDepthMarketDataField*> v;
     {
         std::lock_guard<std::mutex> mdGuard(m_mdMtx);
@@ -2323,11 +2512,11 @@ int CLocalTraderApi::ReqQryDepthMarketData(CThostFtdcQryDepthMarketDataField *pQ
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryDepthMarketData(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryDepthMarketDataMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryDepthMarketData(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryDepthMarketDataMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2335,7 +2524,6 @@ int CLocalTraderApi::ReqQryDepthMarketData(CThostFtdcQryDepthMarketDataField *pQ
 ///请求查询投资者结算结果
 int CLocalTraderApi::ReqQrySettlementInfo(CThostFtdcQrySettlementInfoField *pQrySettlementInfo, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQrySettlementInfo);
-    if (m_pSpi == nullptr) return 0;
 
     const std::string TradingDayForQuery = pQrySettlementInfo->TradingDay;
     const std::string SELECT_NEWEST_SETTLEMENT_RECORD =
@@ -2346,13 +2534,12 @@ int CLocalTraderApi::ReqQrySettlementInfo(CThostFtdcQrySettlementInfoField *pQry
         + "' ORDER BY TradingDay DESC LIMIT 1;";
     CSqliteHandler::SQL_VALUES posSqlValues;
     sqlHandler.SelectData(SELECT_NEWEST_SETTLEMENT_RECORD, posSqlValues);
-    if (m_pSpi == nullptr) return 0;
     for (auto it = posSqlValues.begin(); it != posSqlValues.end(); ++it)
     {
         if (it->empty())
         {
-            m_pSpi->OnRspQrySettlementInfo(nullptr, &m_successRspInfo, nRequestID,
-                (it + 1 == posSqlValues.end() ? true : false));
+            m_messageQueue.addMsg(OnRspQrySettlementInfoMsg(nullptr, &m_successRspInfo, nRequestID,
+                (it + 1 == posSqlValues.end() ? true : false)));
         }
         else
         {
@@ -2382,14 +2569,14 @@ int CLocalTraderApi::ReqQrySettlementInfo(CThostFtdcQrySettlementInfoField *pQry
                     now_index += SettlementContent.size() - now_index;
                     bIsLast = true;
                 }
-                m_pSpi->OnRspQrySettlementInfo(&SettlementInfo, &m_successRspInfo, nRequestID, bIsLast);
+                m_messageQueue.addMsg(OnRspQrySettlementInfoMsg(&SettlementInfo, &m_successRspInfo, nRequestID, bIsLast));
             }
             break;
         }
     }
     if (posSqlValues.empty())
     {
-        m_pSpi->OnRspQrySettlementInfo(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQrySettlementInfoMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2397,7 +2584,6 @@ int CLocalTraderApi::ReqQrySettlementInfo(CThostFtdcQrySettlementInfoField *pQry
 ///请求查询投资者持仓明细
 int CLocalTraderApi::ReqQryInvestorPositionDetail(CThostFtdcQryInvestorPositionDetailField *pQryInvestorPositionDetail, int nRequestID) {
     CHECK_LOGIN_INVESTOR(pQryInvestorPositionDetail);
-    if (m_pSpi == nullptr) return 0;
     std::vector<CThostFtdcInvestorPositionDetailField*> v;
     {
         std::lock_guard<std::mutex> posGuard(m_positionMtx);
@@ -2415,11 +2601,11 @@ int CLocalTraderApi::ReqQryInvestorPositionDetail(CThostFtdcQryInvestorPositionD
     }
     for (auto it = v.begin(); it != v.end(); ++it)
     {
-        m_pSpi->OnRspQryInvestorPositionDetail(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false));
+        m_messageQueue.addMsg(OnRspQryInvestorPositionDetailMsg(*it, &m_successRspInfo, nRequestID, (it + 1 == v.end() ? true : false)));
     }
     if (v.empty())
     {
-        m_pSpi->OnRspQryTrade(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQryInvestorPositionDetailMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     return 0;
 }
@@ -2432,13 +2618,12 @@ int CLocalTraderApi::ReqQrySettlementInfoConfirm(CThostFtdcQrySettlementInfoConf
         + "' and InvestorID='" + m_userID + "' ORDER BY TradingDay DESC LIMIT 1;";
     CSqliteHandler::SQL_VALUES posSqlValues;
     sqlHandler.SelectData(SELECT_NEWEST_SETTLEMENT_RECORD, posSqlValues);
-    if (m_pSpi == nullptr) return 0;
     for (auto it = posSqlValues.begin(); it != posSqlValues.end(); ++it)
     {
         if (it->empty() || it->at("ConfirmDay").empty())
         {
-            m_pSpi->OnRspQrySettlementInfoConfirm(nullptr, &m_successRspInfo, nRequestID,
-                (it + 1 == posSqlValues.end() ? true : false));
+            m_messageQueue.addMsg(OnRspQrySettlementInfoConfirmMsg(nullptr, &m_successRspInfo, nRequestID,
+                (it + 1 == posSqlValues.end() ? true : false)));
         }
         else
         {
@@ -2449,13 +2634,13 @@ int CLocalTraderApi::ReqQrySettlementInfoConfirm(CThostFtdcQrySettlementInfoConf
             strncpy(SettlementInfoConfirm.ConfirmTime, it->at("ConfirmTime").c_str(), sizeof(SettlementInfoConfirm.ConfirmTime));
             strncpy(SettlementInfoConfirm.AccountID, pQrySettlementInfoConfirm->InvestorID, sizeof(SettlementInfoConfirm.AccountID));
             strncpy(SettlementInfoConfirm.CurrencyID, "CNY", sizeof(SettlementInfoConfirm.CurrencyID));
-            m_pSpi->OnRspQrySettlementInfoConfirm(&SettlementInfoConfirm, &m_successRspInfo, nRequestID,
-                (it + 1 == posSqlValues.end() ? true : false));
+            m_messageQueue.addMsg(OnRspQrySettlementInfoConfirmMsg(&SettlementInfoConfirm, &m_successRspInfo, nRequestID,
+                (it + 1 == posSqlValues.end() ? true : false)));
         }
     }
     if (posSqlValues.empty())
     {
-        m_pSpi->OnRspQrySettlementInfoConfirm(nullptr, &m_successRspInfo, nRequestID, true);
+        m_messageQueue.addMsg(OnRspQrySettlementInfoConfirmMsg(nullptr, &m_successRspInfo, nRequestID, true));
     }
     
     return 0;

@@ -12,6 +12,7 @@ CSqliteHandler::CSqliteHandler(const std::string& dbPath,
     , m_tableNames(tableNames), m_running(true)
 {
     OpenSqlDB();
+
     m_syncThread = std::thread([this]() {
         size_t count = 0;
         while (m_running)
@@ -23,7 +24,6 @@ CSqliteHandler::CSqliteHandler(const std::string& dbPath,
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-        // TODO: the below part will actually not be run in Windows, do you guys know why?
         std::cout << "Quit the CSqliteHandler, let's sync for the last time...!" << std::endl;
         SyncMemoryAndFileDatabase(); //sync once more before exit
     });
@@ -126,7 +126,6 @@ bool CSqliteHandler::OpenSqlDB()
     //{
     //    return false;
     //}
-
     std::cout << "OpenSqlDB done!~" << std::endl;
     return true;
 }
@@ -212,6 +211,7 @@ bool CSqliteHandler::CreateTable(const std::string& sql, const std::string& tabl
     }
     if (SQLITE_OK != ret)
     {
+        std::cerr << "CreateTable " << tableName << " but sqlite3_exec ret is not OK!" << std::endl;
         return false;
     }
 
@@ -229,6 +229,7 @@ bool CSqliteHandler::CreateTable(const std::string& sql, const std::string& tabl
     // into memory database, finally we should detach them.
     if (!AttachMemoryAndFileDatabase())
     {
+        std::cerr << "CreateTable " << tableName << " but AttachMemoryAndFileDatabase fail!" << std::endl;
         return false;
     }
     const std::string targetTable = tableName;
@@ -246,13 +247,14 @@ bool CSqliteHandler::CreateTable(const std::string& sql, const std::string& tabl
     }
     if (!DetachMemoryAndFileDatabase())
     {
+        std::cerr << "CreateTable " << tableName << " but DetachMemoryAndFileDatabase fail!" << std::endl;
         return false;
     }
     if (SQLITE_OK != ret)
     {
+        std::cerr << "CreateTable " << tableName << " but sqlite3_exec ret is not OK!" << std::endl;
         return false;
     }
-
     return ret == SQLITE_OK;
 }
 

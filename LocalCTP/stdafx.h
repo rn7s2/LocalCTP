@@ -11,6 +11,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <csignal>
 #endif
 
 
@@ -138,5 +139,37 @@ const std::string base64_chars =
 
 std::string base64_encode(unsigned char const* bytes_to_encode, unsigned int in_len);
 std::string base64_decode(std::string const& encoded_string);
+
+enum class RUNNING_MODE :char
+{
+    REALTIME_MODE = 0, //实时模式
+    BACKTEST_MODE = 1, //回测模式
+    NONE = 2,
+};
+inline std::ostream& operator<<(std::ostream& o, RUNNING_MODE m)
+{
+    switch (m)
+    {
+    case RUNNING_MODE::REALTIME_MODE:
+        o << "REALTIME_MODE";
+        break;
+    case RUNNING_MODE::BACKTEST_MODE:
+        o << "BACKTEST_MODE";
+        break;
+    case RUNNING_MODE::NONE:
+    default:
+        o << "NONE";
+        break;
+    }
+    return o;
+}
+
+struct LocalCTPConfig
+{
+    RUNNING_MODE running_mode = RUNNING_MODE::REALTIME_MODE;
+    CLeeDateTime backtest_startdate = CLeeDateTime(2025, 3, 13, 0, 0, 0);
+    bool exit_after_settlement = false;
+    std::string settlement_time = "17:00:00";
+};
 
 } // end namespace localCTP

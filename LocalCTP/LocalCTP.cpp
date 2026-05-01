@@ -1,7 +1,7 @@
 ﻿#include "stdafx.h"
 #include "LocalTraderApi.h"
 #include "Properties.h"
-
+#include <iostream>
 #define READ_CHAR_ARRAY_MEMBER(m) \
     { std::getline(i, temp, ','); \
       strncpy(instr.m, temp.c_str(), sizeof(instr.m)); }
@@ -237,7 +237,7 @@ CThostFtdcOrderField CLocalTraderApi::OrderData::genrateRtnOrderFromInputOrder(
     ///剩余数量
     rtnOrder.VolumeTotal = rtnOrder.VolumeTotalOriginal;
     ///报单日期
-    const CLeeDateTime now_time = CLeeDateTime::GetCurrentTime();
+    const CLeeDateTime now_time = CLocalTraderApi::getNowTime(); //CLeeDateTime::GetCurrentTime();
     strncpy(rtnOrder.InsertDate, now_time.Format("%Y%m%d").c_str(), sizeof(rtnOrder.InsertDate));
     ///委托时间
     strncpy(rtnOrder.InsertTime, now_time.Format("%H:%M:%S").c_str(), sizeof(rtnOrder.InsertTime));
@@ -373,7 +373,7 @@ void CLocalTraderApi::OrderData::handleCancel(bool cancelFromClient)
     strncpy(rtnOrder.StatusMsg, getStatusMsgByStatus(rtnOrder.OrderStatus).c_str(),
         sizeof(rtnOrder.StatusMsg));
 
-    const CLeeDateTime now_time = CLeeDateTime::GetCurrentTime();
+    const CLeeDateTime now_time = CLocalTraderApi::getNowTime(); //CLeeDateTime::GetCurrentTime();
     ///成交时间
     strncpy(rtnOrder.CancelTime, now_time.Format("%H:%M:%S").c_str(),
         sizeof(rtnOrder.CancelTime));
@@ -452,8 +452,8 @@ void CLocalTraderApi::OrderData::getRtnTrade(const TradePriceVec& tradePriceVec,
 
         ///数量
         Trade.Volume = tradedSize;
-        ///成交时期
-        const CLeeDateTime now_time = CLeeDateTime::GetCurrentTime();
+        ///成交时间
+        const CLeeDateTime now_time = CLocalTraderApi::getNowTime(); //CLeeDateTime::GetCurrentTime();
         strncpy(Trade.TradeDate, now_time.Format("%Y%m%d").c_str(), sizeof(Trade.TradeDate));
         ///成交时间
         strncpy(Trade.TradeTime, now_time.Format("%H:%M:%S").c_str(), sizeof(Trade.TradeTime));
@@ -491,15 +491,13 @@ void CLocalTraderApi::OrderData::getRtnTrade(const TradePriceVec& tradePriceVec,
 void CLocalTraderApi::OrderData::sendRtnOrder()
 {
     api.saveOrderToDb(rtnOrder);
-    if (api.getSpi() == nullptr) return;
-    api.getSpi()->OnRtnOrder(&rtnOrder);
+    api.getMessageQueue().addMsg(OnRtnOrderMsg(&rtnOrder));
 }
 
 void CLocalTraderApi::OrderData::sendRtnTrade(CThostFtdcTradeFieldWrapper& rtnTrade)
 {
     api.saveDataToDb(rtnTrade);
-    if (api.getSpi() == nullptr) return;
-    api.getSpi()->OnRtnTrade(&(rtnTrade.data));
+    api.getMessageQueue().addMsg(OnRtnTradeMsg(&(rtnTrade.data)));
 }
 
 CThostFtdcInvestorPositionDetailField CLocalTraderApi::PositionData::getPositionDetailFromOpenTrade(
@@ -552,7 +550,7 @@ void CLocalTraderApi::PositionData::addPositionDetail(
 
 #define ACCUMULATE_WITH_SAME_NAME(FIELD) ACCUMULATE_WITH_DIFFERENT_NAME(FIELD, FIELD)
 
-CLocalTraderApi::CSettlementHandler::CSettlementHandler(CSqliteHandler& _sqlHandler)
+CSettlementHandler::CSettlementHandler(CSqliteHandler& _sqlHandler)
     : m_sqlHandler(_sqlHandler)
     , m_running(true)
     , m_tradingAccountUpdateFromPositionSql1(
@@ -575,11 +573,21 @@ ACCUMULATE_WITH_SAME_NAME(FrozenCash) ";"
         " Available = Balance-CurrMargin-FrozenMargin-FrozenCommission-FrozenCash;"
     )
     , m_sleepSecond(1)
-    , m_settlementStartHour(17)
+    , m_nextSettlementTime()
     , m_count(0)
     , m_timerThread([this]() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));//等待其他线程的initInstrMap初始化好
         CLocalTraderApi::initInstrMap();
-        if (!checkSettlement())//启动后先判断结算一次
+        std::string tradingDay = CLocalTraderApi::StaticGetTradingDay();
+        m_nextSettlementTime.SetDateTime(
+            std::stoi(tradingDay.substr(0, 4)), // "20250408"
+            std::stoi(tradingDay.substr(4, 2)),
+            std::stoi(tradingDay.substr(6, 2)),
+            std::stoi(CLocalTraderApi::m_settlementTime.substr(0, 2)), // "17:00:00"
+            std::stoi(CLocalTraderApi::m_settlementTime.substr(3, 2)),
+            std::stoi(CLocalTraderApi::m_settlementTime.substr(6, 2)));
+        std::cout << "[LocalCTP] next Settlement Time is " << m_nextSettlementTime.Format() << std::endl;
+        if (checkSettlement())//启动后先判断结算一次
         {
             doSettlement();
         }
@@ -587,7 +595,9 @@ ACCUMULATE_WITH_SAME_NAME(FrozenCash) ";"
         {
             //别在一次sleep中sleep太长时间(影响Join的等待时间)
             std::this_thread::sleep_for(std::chrono::seconds(m_sleepSecond));
-            if (++m_count >= 60 * 2 / m_sleepSecond)//每隔固定时间间隔,检查是否需要结算
+            const int checkInterval =
+                (CLocalTraderApi::m_runningMode == RUNNING_MODE::BACKTEST_MODE ? 10 : (60 * 2));
+            if (++m_count >= checkInterval / m_sleepSecond)//每隔固定时间间隔,检查是否需要结算
             {
                 m_count = 0;
             }
@@ -595,36 +605,46 @@ ACCUMULATE_WITH_SAME_NAME(FrozenCash) ";"
             {
                 continue;
             }
-            if (!checkSettlement())
+            if (checkSettlement())
             {
                 doSettlement();
+                if (CLocalTraderApi::m_exitAfterSettlement)
+                {
+                    std::cout << "It should exit the program after settlement!" << std::endl;
+#ifdef _WIN32
+                    std::exit(1);
+#else
+                    // 主动发出SIGTERM信号
+                    kill(getpid(), SIGTERM);
+#endif
+                }
             }
         }
     })
 {
 }
 
-CLocalTraderApi::CSettlementHandler::~CSettlementHandler()
+CSettlementHandler::~CSettlementHandler()
 {
     m_running = false;
     if (m_timerThread.joinable())
         m_timerThread.join();
 }
 
-bool CLocalTraderApi::CSettlementHandler::checkSettlement()
+bool CSettlementHandler::checkSettlement()
 {
     // 在什么情况下需要进行结算? 需要满足以下三个条件:
     // 1.当前日期是交易日
-    // 2.当前时间大于结算开始时间(如 17:00 )
+    // 2.当前时间大于结算开始时间(如 当前交易日的17:00 )
     // 3.数据库结算表中没有当天的结算记录
-    const auto nowTime = CLeeDateTime::GetCurrentTime();
+    const auto nowTime = CLocalTraderApi::getNowTime(); //CLeeDateTime::GetCurrentTime();
     if (!isTradingDay(nowTime))
     {
-        return true;
+        return false;
     }
-    if (nowTime.GetHour() < m_settlementStartHour)
+    if (nowTime < m_nextSettlementTime)
     {
-        return true;
+        return false;
     }
     CSqliteHandler::SQL_VALUES sqlValues;
     m_sqlHandler.SelectData(
@@ -632,12 +652,12 @@ bool CLocalTraderApi::CSettlementHandler::checkSettlement()
         sqlValues);
     if (sqlValues.empty())
     {
-        return false;
+        return true;
     }
-    return true;
+    return false;
 }
 
-void CLocalTraderApi::CSettlementHandler::init_format_settlement()
+void CSettlementHandler::init_format_settlement()
 {
     static bool bFirstReadFormat = true;
 
@@ -778,6 +798,11 @@ void CLocalTraderApi::CSettlementHandler::init_format_settlement()
         if (!format_settlement_account_summary16.empty())
         {
             format_settlement_account_summary16 = format_settlement_account_summary16.substr(1);
+        }
+        format_settlement_account_summary17 = prop.getValue("settlement_account_summary17", std::string());
+        if (!format_settlement_account_summary17.empty())
+        {
+            format_settlement_account_summary17 = format_settlement_account_summary17.substr(1);
         }
         format_settlement_deposit_withdrawal_head1 = prop.getValue("settlement_deposit_withdrawal_head1", std::string());
         if (!format_settlement_deposit_withdrawal_head1.empty())
@@ -1104,19 +1129,20 @@ void CLocalTraderApi::CSettlementHandler::init_format_settlement()
     return;
 }
 
-void CLocalTraderApi::CSettlementHandler::accumulateTradingAccountFromPosition()
+void CSettlementHandler::accumulateTradingAccountFromPosition()
 {
     m_sqlHandler.Update(m_tradingAccountUpdateFromPositionSql1);
     m_sqlHandler.Update(m_tradingAccountUpdateFromPositionSql2);
     m_sqlHandler.Update(m_tradingAccountUpdateFromPositionSql3);
 }
 
-void CLocalTraderApi::CSettlementHandler::doSettlement()
+void CSettlementHandler::doSettlement()
 {
     init_format_settlement();
 
-    CLeeDateTime nowTime = CLeeDateTime::GetCurrentTime();
-    const std::string TradingDay = nowTime.Format("%Y%m%d");
+
+    const std::string TradingDay = CLocalTraderApi::StaticGetTradingDay();
+    std::cout << "[LocalCTP] doSettlement for TradingDay " << TradingDay << std::endl;
     doWorkInitialSettlement(TradingDay);//结算的前期工作
     CSqliteHandler::SQL_VALUES sqlValues;
     m_sqlHandler.SelectData(CThostFtdcTradingAccountFieldWrapper::SELECT_SQL, sqlValues);
@@ -1127,28 +1153,34 @@ void CLocalTraderApi::CSettlementHandler::doSettlement()
 
         doGenerateUserSettlement(tradingAccountFieldWrapper, TradingDay);
     }
-    nowTime.SetMiddleNight();
-    const std::string newTradingDay = getNextTradingDay(nowTime);
+    const CLeeDateTime dtTradingDay(
+        std::stoi(TradingDay.substr(0, 4)),
+        std::stoi(TradingDay.substr(4, 2)),
+        std::stoi(TradingDay.substr(6, 2)),
+        0,
+        0,
+        0);
+    const std::string newTradingDay = getNextTradingDay(dtTradingDay);
     doWorkAfterSettlement(TradingDay, newTradingDay);//结算后的工作
+
+    m_nextSettlementTime.SetDateTime(
+        std::stoi(newTradingDay.substr(0, 4)), // "20250408"
+        std::stoi(newTradingDay.substr(4, 2)),
+        std::stoi(newTradingDay.substr(6, 2)),
+        std::stoi(CLocalTraderApi::m_settlementTime.substr(0, 2)), // "17:00:00"
+        std::stoi(CLocalTraderApi::m_settlementTime.substr(3, 2)),
+        std::stoi(CLocalTraderApi::m_settlementTime.substr(6, 2)));
     return;
 }
 
 
-void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
+void CSettlementHandler::doWorkInitialSettlement(
     const std::string& oldTradingDay)
 {
     CSqliteTransactionHandler transactionHandle(m_sqlHandler);
 
     //更新所有持仓明细, 对每一笔持仓明细, 以用于结算的价格作为其结算价, 计算保证金和盈亏等, 更新持仓明细表,
     //并且修改合约到期的合约的持仓明细, 将其持仓数量修改为0等.
-    const std::string positiondetailInitialSettlementSql1
-        = std::string("UPDATE CThostFtdcInvestorPositionDetailField SET Volume = 0 \
- WHERE CThostFtdcInvestorPositionDetailField.InstrumentID in \
-   (SELECT CThostFtdcInstrumentField.InstrumentID from CThostFtdcInstrumentField \
- WHERE CThostFtdcInstrumentField.ExpireDate <= '") + oldTradingDay + "');";
-
-    m_sqlHandler.Update(positiondetailInitialSettlementSql1);
-
     CSqliteHandler::SQL_VALUES posDetailSqlValues;
     m_sqlHandler.SelectData(CThostFtdcInvestorPositionDetailFieldWrapper::SELECT_SQL, posDetailSqlValues);
     std::vector<CThostFtdcInvestorPositionDetailFieldWrapper> posDetailVec;
@@ -1164,12 +1196,9 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
         auto itMdData = CLocalTraderApi::m_mdData.find(itInstr->second.InstrumentID);
         if (itMdData != CLocalTraderApi::m_mdData.end())
         {
-            //更新持仓明细中的结算价(因为可能用户没有给这个账号的API投喂行情)
+            //更新持仓明细中的结算价(因为可能用户没有给这个账号的API投喂行情,例如通过别的账户的API来投喂的)
             posDetail.SettlementPrice = itMdData->second.SettlementPrice;
         }
-        posDetail.Margin = posDetail.SettlementPrice * posDetail.Volume *
-            itInstr->second.VolumeMultiple * posDetail.MarginRateByMoney +
-            posDetail.Volume * posDetail.MarginRateByVolume;//更新保证金
         if (!isOptions(itInstr->second.ProductClass))
         {
             const double positionPrice(strcmp(posDetail.OpenDate, posDetail.TradingDay) == 0 ?
@@ -1181,9 +1210,22 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
                 (posDetail.SettlementPrice - posDetail.OpenPrice) *
                 posDetail.Volume * itInstr->second.VolumeMultiple;//更新浮动盈亏
         }
+        //如果合约已过期, 则将持仓设为0(即模拟强制平仓操作,无交易手续费,不产生交易记录).
+        //感谢Q友763606282"啦啦啦"提醒 强制平仓时需考虑持仓盈亏和期权权利金.
+        if (std::string(itInstr->second.ExpireDate) <= oldTradingDay)
+        {
+            posDetail.Volume = 0;
+        }
+        posDetail.Margin = posDetail.SettlementPrice * posDetail.Volume *
+            itInstr->second.VolumeMultiple * posDetail.MarginRateByMoney +
+            posDetail.Volume * posDetail.MarginRateByVolume;//更新保证金
 
         posDetailVec.emplace_back(posDetail);
     }
+    // 删除数据库中的持仓记录
+    // 如果不删除, 则下方的 REPLACE INTO 的 SQL 语句貌似不生效
+    const std::string deletePositionDetailSql = "DELETE FROM CThostFtdcInvestorPositionDetailField;";
+    m_sqlHandler.Delete(deletePositionDetailSql);
     // 将更新后的持仓明细的持仓记录, 全部写入到数据库中
     for (auto& posDetail : posDetailVec)
     {
@@ -1198,14 +1240,6 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
     //所以使用多个Update语句来分步执行更新
     //20230911更新(为支持将昨仓和今仓记录合并): 算了,完全用SQL语句来更新太麻烦了
     //, 最终选择: 从数据库持仓表读取到内存中的持仓变量,然后修改变量,再写回到数据库中
-    const std::string positionInitialSettlementSql1
-        = std::string("UPDATE CThostFtdcInvestorPositionField SET Position = 0 \
- WHERE CThostFtdcInvestorPositionField.InstrumentID in \
-   (SELECT CThostFtdcInstrumentField.InstrumentID from CThostFtdcInstrumentField \
- WHERE CThostFtdcInstrumentField.ExpireDate <= '") + oldTradingDay + "');";
-
-    m_sqlHandler.Update(positionInitialSettlementSql1);
-
     CSqliteHandler::SQL_VALUES posSqlValues;
     m_sqlHandler.SelectData(CThostFtdcInvestorPositionFieldWrapper::SELECT_SQL, posSqlValues);
     std::vector<CThostFtdcInvestorPositionFieldWrapper> todayPosVec;
@@ -1223,7 +1257,7 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
         auto itMdData = CLocalTraderApi::m_mdData.find(itInstr->second.InstrumentID);
         if (itMdData != CLocalTraderApi::m_mdData.end())
         {
-            //更新持仓中的结算价(因为可能用户没有给这个账号的API投喂行情)
+            //更新持仓中的结算价(因为可能用户没有给这个账号的API投喂行情,例如通过别的账户的API来投喂的)
             pos.SettlementPrice = itMdData->second.SettlementPrice;
         }
         if (!isOptions(itInstr->second.ProductClass))
@@ -1231,6 +1265,16 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
             pos.PositionProfit = (pos.PosiDirection == THOST_FTDC_PD_Long ? 1.0 : -1.0) *
                 (pos.SettlementPrice * pos.Position * itInstr->second.VolumeMultiple
                     - pos.PositionCost);//更新持仓盈亏
+        }
+        if (std::string(itInstr->second.ExpireDate) <= oldTradingDay)
+        {
+            //模拟强制平仓, 对期权合约的持仓按结算价平仓(无交易手续费,不产生交易记录), 更新权利金收支(CashIn)
+            if (isOptions(itInstr->second.ProductClass))
+            {
+                pos.CashIn += (pos.PosiDirection == THOST_FTDC_PD_Long ? 1.0 : -1.0) *
+                    pos.SettlementPrice * pos.Position * itInstr->second.VolumeMultiple;
+            }
+            pos.Position = 0;
         }
         pos.PositionCost = pos.SettlementPrice * pos.Position *
             itInstr->second.VolumeMultiple;//更新持仓成本
@@ -1253,7 +1297,7 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
         const auto& pos = yesterdayPos.data;
         const auto relatedTodayPosKey = CLocalTraderApi::generatePositionKey(
                pos.InstrumentID,
-               getDirectionFromPositionDirection(pos.PosiDirection),
+               CLocalTraderApi::getDirectionFromPositionDirection(pos.PosiDirection),
                THOST_FTDC_PSD_Today);
         auto itTodayPos = std::find_if(todayPosVec.begin(), todayPosVec.end(),
             [&](const CThostFtdcInvestorPositionFieldWrapper& p) {
@@ -1334,7 +1378,7 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
     for (auto& todayPos : todayPosVec)
     {
         todayPos.data.PositionDate =
-            (isSpecialExchange(todayPos.data.ExchangeID) ?
+            (CLocalTraderApi::isSpecialExchange(todayPos.data.ExchangeID) ?
             THOST_FTDC_PSD_History : THOST_FTDC_PSD_Today);
         m_sqlHandler.Insert(todayPos.generateInsertSql());
     }
@@ -1343,7 +1387,7 @@ void CLocalTraderApi::CSettlementHandler::doWorkInitialSettlement(
     accumulateTradingAccountFromPosition();
 }
 
-void CLocalTraderApi::CSettlementHandler::doWorkAfterSettlement(
+void CSettlementHandler::doWorkAfterSettlement(
     const std::string& oldTradingDay, const std::string& newTradingDay)
 {
     CSqliteTransactionHandler transactionHandle(m_sqlHandler);
@@ -1448,7 +1492,7 @@ struct MergedPositionData
     }
 };
 
-void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
+void CSettlementHandler::doGenerateUserSettlement(
     const CThostFtdcTradingAccountFieldWrapper& tradingAccountFieldWrapper,
     const std::string& TradingDay)
 {
@@ -1497,7 +1541,7 @@ void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
             + brokerID + "' and InvestorID='" + userID
             + "' and TradingDay = '" + TradingDay
             + "' and CashIn>0;";
-        sqlHandler.SelectData(selectTradeSql, tradeSqlValues);
+        m_sqlHandler.SelectData(selectTradeSql, tradeSqlValues);
         for (const auto& rowValue : tradeSqlValues)
         {
             try
@@ -1543,7 +1587,11 @@ void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
         ostrstr << ch_single_line << "\r\n";
         sprintf(ch_single_line, format_settlement_account_summary15.c_str(), negativeCashIn, (LTZ(data.Available) ? (0 - data.Available) : 0));
         ostrstr << ch_single_line << "\r\n";
-        sprintf(ch_single_line, format_settlement_account_summary16.c_str());
+        std::ostringstream runningModeStr;
+        runningModeStr << CLocalTraderApi::m_runningMode;
+        sprintf(ch_single_line, format_settlement_account_summary16.c_str(), runningModeStr.str().c_str(), CLeeDateTime::now().Format().c_str());
+        ostrstr << ch_single_line << "\r\n";
+        sprintf(ch_single_line, format_settlement_account_summary17.c_str());
         ostrstr << ch_single_line << "\r\n";
 
         // 出入金.
@@ -1580,7 +1628,7 @@ void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
             + brokerID + "' and InvestorID='" + userID
             + "' and TradingDay = '" + TradingDay
             +"' ORDER BY TradeID ASC ;";
-        sqlHandler.SelectData(selectTradeSql, tradeSqlValues);
+        m_sqlHandler.SelectData(selectTradeSql, tradeSqlValues);
         if (tradeSqlValues.empty())//若没有找到该账户成交记录
         {
             return;
@@ -1666,7 +1714,7 @@ void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
             + brokerID + "' and InvestorID='" + userID
             + "' and CloseDate = '" + TradingDay
             + "';";
-        sqlHandler.SelectData(selectCloseDetailSql, closeDetailSqlValues);
+        m_sqlHandler.SelectData(selectCloseDetailSql, closeDetailSqlValues);
         if (closeDetailSqlValues.empty())//若没有找到该账户平仓明细记录
         {
             return;
@@ -1743,7 +1791,7 @@ void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
             + brokerID + "' and InvestorID='"
             + userID + "' and Volume != 0;";
             // = CThostFtdcInvestorPositionDetailFieldWrapper::generateSelectSqlByUserID(brokerID, userID);
-        sqlHandler.SelectData(selectPosDetailSql, posDetailSqlValues);
+        m_sqlHandler.SelectData(selectPosDetailSql, posDetailSqlValues);
         if (posDetailSqlValues.empty())//若没有找到该账户持仓明细记录
         {
             return;
@@ -1828,7 +1876,7 @@ void CLocalTraderApi::CSettlementHandler::doGenerateUserSettlement(
             + brokerID + "' and InvestorID='"
             + userID + "' and Position != 0;";
             // = CThostFtdcInvestorPositionFieldWrapper::generateSelectSqlByUserID(brokerID, userID);
-        sqlHandler.SelectData(selectPosSql, posSqlValues);
+        m_sqlHandler.SelectData(selectPosSql, posSqlValues);
         if (posSqlValues.empty())//若没有找到该账户持仓记录
         {
             return;
